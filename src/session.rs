@@ -1,4 +1,7 @@
+use std::env;
 use std::fs;
+use std::os::unix::fs::PermissionsExt;
+use std::path::Path;
 use swayipc::{Connection, Node, NodeLayout, NodeType, ScratchpadState};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -165,5 +168,35 @@ fn cmdline(pid: i32) -> Option<Vec<String>> {
         .filter(|arg| !arg.is_empty())
         .map(|arg| String::from_utf8_lossy(arg).into_owned())
         .collect();
-    (!argv.is_empty()).then_some(argv)
+    (!argv.is_empty()).then(|| repair_argv(argv))
+}
+
+/// Recovers an argument vector from a process that overwrote its own argv area.
+///
+/// For example: "/usr/lib/signal-desktop/signal-desktop --" with the separating NUL gone
+fn repair_argv(argv: Vec<String>) -> Vec<String> {
+    let [only] = argv.as_slice() else {
+        return argv;
+    };
+    if is_program(only) {
+        return argv;
+    }
+    let split: Vec<String> = only.split_whitespace().map(str::to_string).collect();
+    match split.first() {
+        Some(program) if is_program(program) => split,
+        _ => argv,
+    }
+}
+
+/// Whether a name can be started, either as a path or through a lookup in $PATH.
+fn is_program(name: &str) -> bool {
+    if name.contains('/') {
+        return is_executable(Path::new(name));
+    }
+    env::var_os("PATH")
+        .is_some_and(|path| env::split_paths(&path).any(|dir| is_executable(&dir.join(name))))
+}
+
+fn is_executable(path: &Path) -> bool {
+    fs::metadata(path).is_ok_and(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)
 }
