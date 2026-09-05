@@ -45,6 +45,7 @@ fn run() -> Result<(), Box<dyn Error>> {
         "restore" => restore::restore(&load(&path)?)?,
         "watch" => watch(&path)?,
         "dump" => print!("{}", dump(&load(&path)?)),
+        "version" | "--version" => println!("swaymnesia {}", std::env!("CARGO_PKG_VERSION")),
         _ => println!("{USAGE}"),
     }
     Ok(())
