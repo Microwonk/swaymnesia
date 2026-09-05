@@ -1,14 +1,99 @@
 use crate::config::Config;
+use crate::format;
 use std::env;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
+use std::path::PathBuf;
 use swayipc::{Connection, Node, NodeLayout, NodeType, ScratchpadState};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Session {
     pub workspaces: Vec<Workspace>,
     pub scratchpad: Vec<Window>,
+}
+
+impl Session {
+    pub fn default_path() -> PathBuf {
+        let data_home = env::var_os("XDG_DATA_HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| {
+                PathBuf::from(env::var_os("HOME").unwrap_or_default()).join(".local/share")
+            });
+        data_home.join("swaymnesia/session.swmn")
+    }
+
+    pub fn encode(&self) -> Vec<u8> {
+        format::encode(self)
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Session, crate::format::Error> {
+        format::decode(bytes)
+    }
+
+    /// Dump the whole session's info
+    pub fn dump(&self) -> String {
+        let mut out = String::new();
+        for Workspace {
+            name,
+            output,
+            layout,
+            windows,
+        } in &self.workspaces
+        {
+            out.push_str(&format!(
+                "workspace {name} on {output} [{}]\n",
+                layout.as_command()
+            ));
+            for window in windows {
+                dump_window(&mut out, window);
+            }
+        }
+        if !self.scratchpad.is_empty() {
+            out.push_str("scratchpad\n");
+            for window in &self.scratchpad {
+                dump_window(&mut out, window);
+            }
+        }
+        out
+    }
+}
+
+/// Dump a single window's info
+fn dump_window(
+    out: &mut String,
+    Window {
+        app_id,
+        title,
+        argv,
+        floating,
+        fullscreen,
+        focused,
+        rect,
+    }: &Window,
+) {
+    let mut flags = Vec::new();
+    if *floating {
+        flags.push(format!(
+            "floating {}x{}+{}+{}",
+            rect.width, rect.height, rect.x, rect.y
+        ));
+    }
+    if *fullscreen {
+        flags.push("fullscreen".to_string());
+    }
+    if *focused {
+        flags.push("focused".to_string());
+    }
+    let flags = if flags.is_empty() {
+        String::new()
+    } else {
+        format!(" [{}]", flags.join(", "))
+    };
+    out.push_str(&format!(
+        "  {} {title:?}{flags}\n    {argv:?}\n",
+        if app_id.is_empty() { "?" } else { &app_id },
+    ));
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
