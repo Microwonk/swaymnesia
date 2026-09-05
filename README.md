@@ -40,6 +40,31 @@ A window is only restorable if its command line can be read from `/proc`.
 Sessions are keyed on the workspace name, so restoring on a different machine
 (with different outputs) works.
 
+## Configuration
+
+Rules to determine which windows should be saved to the session are read from
+`$XDG_CONFIG_HOME/swaymnesia/config.toml`.
+
+A window is ignored when it matches an `[[ignore]]` rule and no `[[allow]]`
+rule. Using `[[allow]]`s can make broad rules have exceptions, like so:
+
+```toml
+[[ignore]]
+app_id = '^com\.mitchellh\.ghostty$'
+
+[[allow]]
+app_id = '^com\.mitchellh\.ghostty$'
+title = '^zellij-session-'
+```
+
+A rule can have three fields:
+
+* `app_id`: the application id
+* `title`: the window title
+* `command`: the whole command line
+
+Values are regular expressions.
+
 ## Session format
 
 A session is a flat binary file. All integers are little-endian, and a `str` is a

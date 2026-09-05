@@ -1,3 +1,4 @@
+use crate::config::Config;
 use std::env;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
@@ -80,7 +81,7 @@ impl Layout {
 }
 
 /// Captures every workspace with at least one window, as well as any scratchpads
-pub fn capture(conn: &mut Connection) -> Result<Session, swayipc::Error> {
+pub fn capture(conn: &mut Connection, config: &Config) -> Result<Session, swayipc::Error> {
     let tree = conn.get_tree()?;
     let mut workspaces = Vec::new();
     let mut scratchpad = Vec::new();
@@ -88,7 +89,7 @@ pub fn capture(conn: &mut Connection) -> Result<Session, swayipc::Error> {
     for output in &tree.nodes {
         for workspace in &output.nodes {
             let mut windows = Vec::new();
-            collect(workspace, false, &mut windows, &mut scratchpad);
+            collect(workspace, false, &mut windows, &mut scratchpad, config);
 
             let name = workspace.name.clone().unwrap_or_default();
             if name.starts_with("__i3") || windows.is_empty() {
@@ -110,9 +111,15 @@ pub fn capture(conn: &mut Connection) -> Result<Session, swayipc::Error> {
 }
 
 /// Recurses through [node], appending every leaf node into [`windows`]/[`scratchpad`]
-fn collect(node: &Node, floating: bool, windows: &mut Vec<Window>, scratchpad: &mut Vec<Window>) {
+fn collect(
+    node: &Node,
+    floating: bool,
+    windows: &mut Vec<Window>,
+    scratchpad: &mut Vec<Window>,
+    config: &Config,
+) {
     let floating = floating || matches!(node.node_type, NodeType::FloatingCon);
-    if let Some(window) = view(node, floating) {
+    if let Some(window) = view(node, floating, config) {
         if is_scratchpad(node) {
             scratchpad
         } else {
@@ -122,10 +129,10 @@ fn collect(node: &Node, floating: bool, windows: &mut Vec<Window>, scratchpad: &
         return;
     }
     for child in &node.nodes {
-        collect(child, floating, windows, scratchpad);
+        collect(child, floating, windows, scratchpad, config);
     }
     for child in &node.floating_nodes {
-        collect(child, true, windows, scratchpad);
+        collect(child, true, windows, scratchpad, config);
     }
 }
 
@@ -133,7 +140,7 @@ fn is_scratchpad(node: &Node) -> bool {
     !matches!(node.scratchpad_state, None | Some(ScratchpadState::None))
 }
 
-fn view(node: &Node, floating: bool) -> Option<Window> {
+fn view(node: &Node, floating: bool, config: &Config) -> Option<Window> {
     if !node.nodes.is_empty() || !node.floating_nodes.is_empty() {
         return None;
     }
@@ -144,9 +151,14 @@ fn view(node: &Node, floating: bool) -> Option<Window> {
         .or_else(|| node.window_properties.as_ref()?.class.clone())
         .unwrap_or_default();
 
+    let title = node.name.clone().unwrap_or_default();
+    if config.skips(&app_id, &title, &argv.join(" ")) {
+        return None;
+    }
+
     Some(Window {
         app_id,
-        title: node.name.clone().unwrap_or_default(),
+        title,
         argv,
         floating,
         fullscreen: matches!(node.fullscreen_mode, Some(1 | 2)),

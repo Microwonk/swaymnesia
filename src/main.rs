@@ -1,7 +1,9 @@
+mod config;
 mod format;
 mod restore;
 mod session;
 
+use crate::config::Config;
 use crate::session::Workspace;
 use crate::session::{Session, Window};
 use std::env;
@@ -41,7 +43,10 @@ fn run() -> Result<(), Box<dyn Error>> {
     let path = args.next().map_or_else(default_path, PathBuf::from);
 
     match command.as_str() {
-        "save" => save(&session::capture(&mut SwayConnection::new()?)?, &path)?,
+        "save" => save(
+            &session::capture(&mut SwayConnection::new()?, &Config::load()?)?,
+            &path,
+        )?,
         "restore" => restore::restore(&load(&path)?)?,
         "watch" => watch(&path)?,
         "dump" => print!("{}", dump(&load(&path)?)),
@@ -79,6 +84,7 @@ fn load(path: &Path) -> Result<Session, Box<dyn Error>> {
 
 /// Watches the session for as long as sway runs, saving when settled
 fn watch(path: &Path) -> Result<(), Box<dyn Error>> {
+    let config = Config::load()?;
     let events = SwayConnection::new()?.subscribe([EventType::Window, EventType::Workspace])?;
     let (tx, rx) = mpsc::channel();
     thread::spawn(move || {
@@ -101,7 +107,7 @@ fn watch(path: &Path) -> Result<(), Box<dyn Error>> {
             Err(RecvTimeoutError::Disconnected) => return Ok(()),
         }
         if changed_at.is_some_and(|at| at.elapsed() >= SETTLE) {
-            save(&session::capture(&mut conn)?, path)?;
+            save(&session::capture(&mut conn, &config)?, path)?;
             changed_at = None;
         }
     }

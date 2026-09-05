@@ -1,9 +1,10 @@
 [package]
 author = "Nicolas Frey <nicolas.theo.frey@gmail.com>"
 name = "swaymnesia"
-version = "0.1.0"
+version = "0.2.0"
 readme = "README.md"
 edition = "2024"
 
 [dependencies]
+regex = "1"
 swayipc = "4"
