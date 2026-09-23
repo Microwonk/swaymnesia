@@ -29,6 +29,11 @@ exec swaymnesia restore && swaymnesia watch
 * the output it is on,
 * its layout
 
+### Per split
+
+* its layout,
+* the windows and splits in it, in order
+
 ### Per window
 * the application id,
 * the title,
@@ -73,12 +78,16 @@ A session is a flat binary file. All integers are little-endian, and a `str` is 
 u32 byte length followed by that many bytes of UTF-8.
 ```
 header     magic [4]u8 = "SWMN"
-           version u16 = 1
+           version u16 = 2
            workspace count u32
 workspace  name str
            output str
            layout u8, one of 0 splith, 1 splitv, 2 stacked, 3 tabbed
-           window count u32
+           tile count u32, followed by that many tile
+           floating window count u32, followed by that many window
+tile       kind u8, 0 window or 1 split
+           window, for a window
+           layout u8 and tile count u32 followed by that many tile, for a split
 window     app_id str, empty when the view reports none
            title str
            argv count u32, followed by that many str
@@ -88,13 +97,15 @@ trailer    scratchpad window count u32
            window, repeated that many times
 ```
 
-Workspaces and windows appear in the order sway reports them, which is the order
-they are recreated in. `swaymnesia dump` prints output of this format.
+Workspaces, tiles and windows appear in the order sway reports them, which is
+the order they are recreated in. Files written in version 1, which had no
+splits, are still read. `swaymnesia dump` prints output of this format.
 
 ## Limitations
 
-- Only the workspace layout is kept, not the full split tree, so windows come
-  back side by side in their recorded order rather than in nested splits.
+- Splits come back with their layout, but not their sizes.
+- A split holding a single window or split is not kept, as sway does not create
+  one for a lone container either.
 - Two windows belonging to one process share a command line, so restoring starts
   that program twice.
 - A scratchpad window that was showing at save time is hidden on restore.

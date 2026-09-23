@@ -5,7 +5,7 @@ use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::path::PathBuf;
-use swayipc::{Connection, Node, NodeLayout, NodeType, ScratchpadState};
+use swayipc::{Connection, Node, NodeLayout, ScratchpadState};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Session {
@@ -38,24 +38,40 @@ impl Session {
             name,
             output,
             layout,
-            windows,
+            tiles,
+            floating,
         } in &self.workspaces
         {
             out.push_str(&format!(
                 "workspace {name} on {output} [{}]\n",
                 layout.as_command()
             ));
-            for window in windows {
-                dump_window(&mut out, window);
+            for tile in tiles {
+                dump_tile(&mut out, tile, 1);
+            }
+            for window in floating {
+                dump_window(&mut out, window, 1);
             }
         }
         if !self.scratchpad.is_empty() {
             out.push_str("scratchpad\n");
             for window in &self.scratchpad {
-                dump_window(&mut out, window);
+                dump_window(&mut out, window, 1);
             }
         }
         out
+    }
+}
+
+fn dump_tile(out: &mut String, tile: &Tile, depth: usize) {
+    match tile {
+        Tile::Window(window) => dump_window(out, window, depth),
+        Tile::Split { layout, children } => {
+            out.push_str(&format!("{}{}\n", "  ".repeat(depth), layout.as_command()));
+            for child in children {
+                dump_tile(out, child, depth + 1);
+            }
+        }
     }
 }
 
@@ -71,6 +87,7 @@ fn dump_window(
         focused,
         rect,
     }: &Window,
+    depth: usize,
 ) {
     let mut flags = Vec::new();
     if *floating {
@@ -90,8 +107,9 @@ fn dump_window(
     } else {
         format!(" [{}]", flags.join(", "))
     };
+    let indent = "  ".repeat(depth);
     out.push_str(&format!(
-        "  {} {title:?}{flags}\n    {argv:?}\n",
+        "{indent}{} {title:?}{flags}\n{indent}  {argv:?}\n",
         if app_id.is_empty() { "?" } else { &app_id },
     ));
 }
@@ -101,7 +119,20 @@ pub struct Workspace {
     pub name: String,
     pub output: String,
     pub layout: Layout,
-    pub windows: Vec<Window>,
+    /// The tiling windows, in the order sway lays them out
+    pub tiles: Vec<Tile>,
+    pub floating: Vec<Window>,
+}
+
+/// A node of a workspace's tiling tree
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Tile {
+    Window(Window),
+    /// A container holding at least two tiles
+    Split {
+        layout: Layout,
+        children: Vec<Tile>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -145,6 +176,14 @@ impl Layout {
         }
     }
 
+    /// The `split` command that makes a container with the orientation of this layout
+    pub fn split_command(self) -> &'static str {
+        match self {
+            Layout::SplitH | Layout::Tabbed => "splith",
+            Layout::SplitV | Layout::Stacked => "splitv",
+        }
+    }
+
     /// The name sway's `layout` command uses
     pub fn as_command(self) -> &'static str {
         match self {
@@ -173,11 +212,23 @@ pub fn capture(conn: &mut Connection, config: &Config) -> Result<Session, swayip
 
     for output in &tree.nodes {
         for workspace in &output.nodes {
-            let mut windows = Vec::new();
-            collect(workspace, false, &mut windows, &mut scratchpad, config);
+            let tiles: Vec<Tile> = workspace
+                .nodes
+                .iter()
+                .filter_map(|node| tile(node, config))
+                .collect();
+            let mut floating = Vec::new();
+            for node in &workspace.floating_nodes {
+                let into = if is_scratchpad(node) {
+                    &mut scratchpad
+                } else {
+                    &mut floating
+                };
+                collect_floating(node, into, config);
+            }
 
             let name = workspace.name.clone().unwrap_or_default();
-            if name.starts_with("__i3") || windows.is_empty() {
+            if name.starts_with("__i3") || (tiles.is_empty() && floating.is_empty()) {
                 continue;
             }
 
@@ -185,7 +236,8 @@ pub fn capture(conn: &mut Connection, config: &Config) -> Result<Session, swayip
                 name,
                 output: output.name.clone().unwrap_or_default(),
                 layout: Layout::from_node(workspace.layout),
-                windows,
+                tiles,
+                floating,
             });
         }
     }
@@ -195,29 +247,36 @@ pub fn capture(conn: &mut Connection, config: &Config) -> Result<Session, swayip
     })
 }
 
-/// Recurses through [node], appending every leaf node into [`windows`]/[`scratchpad`]
-fn collect(
-    node: &Node,
-    floating: bool,
-    windows: &mut Vec<Window>,
-    scratchpad: &mut Vec<Window>,
-    config: &Config,
-) {
-    let floating = floating || matches!(node.node_type, NodeType::FloatingCon);
-    if let Some(window) = view(node, floating, config) {
-        if is_scratchpad(node) {
-            scratchpad
-        } else {
-            windows
-        }
-        .push(window);
+/// The tiling tree below [node], without the windows that are not saved.
+///
+/// A container left with a single child is replaced by that child. Sway does not split a lone
+/// container either, so such a container could not be restored anyway.
+fn tile(node: &Node, config: &Config) -> Option<Tile> {
+    if node.nodes.is_empty() {
+        return view(node, false, config).map(Tile::Window);
+    }
+    let mut children: Vec<Tile> = node
+        .nodes
+        .iter()
+        .filter_map(|child| tile(child, config))
+        .collect();
+    match children.len() {
+        0 | 1 => children.pop(),
+        _ => Some(Tile::Split {
+            layout: Layout::from_node(node.layout),
+            children,
+        }),
+    }
+}
+
+/// Appends every window of the floating container [node] to [`into`]
+fn collect_floating(node: &Node, into: &mut Vec<Window>, config: &Config) {
+    if let Some(window) = view(node, true, config) {
+        into.push(window);
         return;
     }
-    for child in &node.nodes {
-        collect(child, floating, windows, scratchpad, config);
-    }
-    for child in &node.floating_nodes {
-        collect(child, true, windows, scratchpad, config);
+    for child in node.nodes.iter().chain(&node.floating_nodes) {
+        collect_floating(child, into, config);
     }
 }
 

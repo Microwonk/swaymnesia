@@ -3,29 +3,41 @@
 //! All integers are little-endian. A `str` is a u32 byte length followed by that many bytes of
 //! UTF-8.
 //!
-//!     header     magic [4]u8 = "SWMN"
-//!                version u16 = 1
-//!                workspace count u32
-//!     workspace  name str
-//!                output str
-//!                layout u8, one of 0 splith, 1 splitv, 2 stacked, 3 tabbed
-//!                window count u32
-//!     window     app_id str, empty when the view reports none
-//!                title str
-//!                argv count u32, followed by that many str
-//!                flags u8, bit 0 floating, bit 1 fullscreen, bit 2 focused
-//!                rect i32 x, y, width, height, only meaningful when floating
-//!     trailer    scratchpad window count u32
-//!                window, repeated that many times
+//! ```text
+//! header     magic [4]u8 = "SWMN"
+//!            version u16 = 2
+//!            workspace count u32
+//! workspace  name str
+//!            output str
+//!            layout u8, one of 0 splith, 1 splitv, 2 stacked, 3 tabbed
+//!            tile count u32, followed by that many tile
+//!            floating window count u32, followed by that many window
+//! tile       kind u8, 0 window or 1 split
+//!            window, for a window
+//!            layout u8 and tile count u32 followed by that many tile, for a split
+//! window     app_id str, empty when the view reports none
+//!            title str
+//!            argv count u32, followed by that many str
+//!            flags u8, bit 0 floating, bit 1 fullscreen, bit 2 focused
+//!            rect i32 x, y, width, height, only meaningful when floating
+//! trailer    scratchpad window count u32
+//!            window, repeated that many times
+//! ```
 //!
-//! Workspaces and windows are stored in the order sway reports them, which is the order they are
-//! recreated in.
+//! Workspaces, tiles and windows are stored in the order sway reports them, which is the order
+//! they are recreated in.
 
-use crate::session::{Layout, Rect, Session, Window, Workspace};
+use crate::session::{Layout, Rect, Session, Tile, Window, Workspace};
 use std::fmt;
 
 const MAGIC: [u8; 4] = *b"SWMN";
-const VERSION: u16 = 1;
+const VERSION: u16 = 2;
+
+const TILE_WINDOW: u8 = 0;
+const TILE_SPLIT: u8 = 1;
+
+/// How deep splits may nest in a session file, to keep a corrupt one from exhausting the stack
+const MAX_DEPTH: usize = 64;
 
 const FLAG_FLOATING: u8 = 1 << 0;
 const FLAG_FULLSCREEN: u8 = 1 << 1;
@@ -37,6 +49,8 @@ pub enum Error {
     UnsupportedVersion(u16),
     Truncated,
     BadLayout(u8),
+    BadTile(u8),
+    TooDeep,
     BadUtf8,
 }
 
@@ -47,6 +61,8 @@ impl fmt::Display for Error {
             Error::UnsupportedVersion(v) => write!(f, "unsupported session format version {v}"),
             Error::Truncated => write!(f, "session file truncated"),
             Error::BadLayout(v) => write!(f, "unknown layout {v}"),
+            Error::BadTile(v) => write!(f, "unknown tile kind {v}"),
+            Error::TooDeep => write!(f, "splits nested deeper than {MAX_DEPTH}"),
             Error::BadUtf8 => write!(f, "session file contains invalid UTF-8"),
         }
     }
@@ -64,44 +80,66 @@ pub fn encode(session: &Session) -> Vec<u8> {
         put_str(&mut out, &workspace.name);
         put_str(&mut out, &workspace.output);
         out.push(workspace.layout as u8);
-        put_windows(&mut out, &workspace.windows);
+        put_tiles(&mut out, &workspace.tiles);
+        put_windows(&mut out, &workspace.floating);
     }
 
     put_windows(&mut out, &session.scratchpad);
     out
 }
 
+fn put_tiles(out: &mut Vec<u8>, tiles: &[Tile]) {
+    put_u32(out, tiles.len());
+    for tile in tiles {
+        match tile {
+            Tile::Window(window) => {
+                out.push(TILE_WINDOW);
+                put_window(out, window);
+            }
+            Tile::Split { layout, children } => {
+                out.push(TILE_SPLIT);
+                out.push(*layout as u8);
+                put_tiles(out, children);
+            }
+        }
+    }
+}
+
 fn put_windows(out: &mut Vec<u8>, windows: &[Window]) {
     put_u32(out, windows.len());
     for window in windows {
-        put_str(out, &window.app_id);
-        put_str(out, &window.title);
-        put_u32(out, window.argv.len());
+        put_window(out, window);
+    }
+}
 
-        for arg in &window.argv {
-            put_str(out, arg);
-        }
+fn put_window(out: &mut Vec<u8>, window: &Window) {
+    put_str(out, &window.app_id);
+    put_str(out, &window.title);
+    put_u32(out, window.argv.len());
 
-        let mut flags = 0;
-        if window.floating {
-            flags |= FLAG_FLOATING;
-        }
-        if window.fullscreen {
-            flags |= FLAG_FULLSCREEN;
-        }
-        if window.focused {
-            flags |= FLAG_FOCUSED;
-        }
-        out.push(flags);
+    for arg in &window.argv {
+        put_str(out, arg);
+    }
 
-        for value in [
-            window.rect.x,
-            window.rect.y,
-            window.rect.width,
-            window.rect.height,
-        ] {
-            out.extend_from_slice(&value.to_le_bytes());
-        }
+    let mut flags = 0;
+    if window.floating {
+        flags |= FLAG_FLOATING;
+    }
+    if window.fullscreen {
+        flags |= FLAG_FULLSCREEN;
+    }
+    if window.focused {
+        flags |= FLAG_FOCUSED;
+    }
+    out.push(flags);
+
+    for value in [
+        window.rect.x,
+        window.rect.y,
+        window.rect.width,
+        window.rect.height,
+    ] {
+        out.extend_from_slice(&value.to_le_bytes());
     }
 }
 
@@ -111,7 +149,7 @@ pub fn decode(bytes: &[u8]) -> Result<Session, Error> {
         return Err(Error::BadMagic);
     }
     let version = r.u16()?;
-    if version != VERSION {
+    if !(1..=VERSION).contains(&version) {
         return Err(Error::UnsupportedVersion(version));
     }
 
@@ -121,15 +159,21 @@ pub fn decode(bytes: &[u8]) -> Result<Session, Error> {
     for _ in 0..r.u32()? {
         let name = r.str()?;
         let output = r.str()?;
-        let raw_layout = r.u8()?;
-        let layout = Layout::from_u8(raw_layout).ok_or(Error::BadLayout(raw_layout))?;
+        let layout = take_layout(&mut r)?;
 
-        let windows = take_windows(&mut r)?;
+        let (tiles, floating) = if version == 1 {
+            let (floating, tiling): (Vec<_>, Vec<_>) =
+                take_windows(&mut r)?.into_iter().partition(|w| w.floating);
+            (tiling.into_iter().map(Tile::Window).collect(), floating)
+        } else {
+            (take_tiles(&mut r, 0)?, take_windows(&mut r)?)
+        };
         workspaces.push(Workspace {
             name,
             output,
             layout,
-            windows,
+            tiles,
+            floating,
         });
     }
     let scratchpad = take_windows(&mut r)?;
@@ -140,34 +184,62 @@ pub fn decode(bytes: &[u8]) -> Result<Session, Error> {
     })
 }
 
+fn take_layout(r: &mut Reader<'_>) -> Result<Layout, Error> {
+    let raw = r.u8()?;
+    Layout::from_u8(raw).ok_or(Error::BadLayout(raw))
+}
+
+fn take_tiles(r: &mut Reader<'_>, depth: usize) -> Result<Vec<Tile>, Error> {
+    if depth > MAX_DEPTH {
+        return Err(Error::TooDeep);
+    }
+    // same as in decode above regarding premature allocation
+    let mut tiles = Vec::new();
+    for _ in 0..r.u32()? {
+        tiles.push(match r.u8()? {
+            TILE_WINDOW => Tile::Window(take_window(r)?),
+            TILE_SPLIT => Tile::Split {
+                layout: take_layout(r)?,
+                children: take_tiles(r, depth + 1)?,
+            },
+            kind => return Err(Error::BadTile(kind)),
+        });
+    }
+    Ok(tiles)
+}
+
 fn take_windows(r: &mut Reader<'_>) -> Result<Vec<Window>, Error> {
     // same as in decode above regarding premature allocation
     let mut windows = Vec::new();
     for _ in 0..r.u32()? {
-        let app_id = r.str()?;
-        let title = r.str()?;
-        let mut argv = Vec::new();
-        for _ in 0..r.u32()? {
-            argv.push(r.str()?);
-        }
-        let flags = r.u8()?;
-        let rect = Rect {
-            x: r.i32()?,
-            y: r.i32()?,
-            width: r.i32()?,
-            height: r.i32()?,
-        };
-        windows.push(Window {
-            app_id,
-            title,
-            argv,
-            floating: flags & FLAG_FLOATING != 0,
-            fullscreen: flags & FLAG_FULLSCREEN != 0,
-            focused: flags & FLAG_FOCUSED != 0,
-            rect,
-        });
+        windows.push(take_window(r)?);
     }
     Ok(windows)
+}
+
+fn take_window(r: &mut Reader<'_>) -> Result<Window, Error> {
+    let app_id = r.str()?;
+    let title = r.str()?;
+    let mut argv = Vec::new();
+    for _ in 0..r.u32()? {
+        argv.push(r.str()?);
+    }
+    let flags = r.u8()?;
+    let rect = Rect {
+        x: r.i32()?,
+        y: r.i32()?,
+        width: r.i32()?,
+        height: r.i32()?,
+    };
+    Ok(Window {
+        app_id,
+        title,
+        argv,
+        floating: flags & FLAG_FLOATING != 0,
+        fullscreen: flags & FLAG_FULLSCREEN != 0,
+        focused: flags & FLAG_FOCUSED != 0,
+        rect,
+    })
 }
 
 fn put_u32(out: &mut Vec<u8>, value: usize) {
@@ -225,6 +297,23 @@ impl<'a> Reader<'a> {
 mod tests {
     use super::*;
 
+    fn window(title: &str) -> Window {
+        Window {
+            app_id: "kitty".to_string(),
+            title: title.to_string(),
+            argv: vec!["kitty".to_string()],
+            floating: false,
+            fullscreen: false,
+            focused: false,
+            rect: Rect {
+                x: 0,
+                y: 0,
+                width: 0,
+                height: 0,
+            },
+        }
+    }
+
     fn sample() -> Session {
         Session {
             workspaces: vec![
@@ -232,8 +321,8 @@ mod tests {
                     name: "1".to_string(),
                     output: "eDP-1".to_string(),
                     layout: Layout::Tabbed,
-                    windows: vec![
-                        Window {
+                    tiles: vec![
+                        Tile::Window(Window {
                             app_id: "foot".to_string(),
                             title: "zsh".to_string(),
                             argv: vec!["foot".to_string(), "-e".to_string(), "top".to_string()],
@@ -246,28 +335,43 @@ mod tests {
                                 width: 1920,
                                 height: 1080,
                             },
-                        },
-                        Window {
-                            app_id: String::new(),
-                            title: "it's a \u{e9}dge case; rm -rf".to_string(),
-                            argv: vec!["sh".to_string(), "-c".to_string(), "echo 'hi'".to_string()],
-                            floating: true,
-                            fullscreen: false,
-                            focused: false,
-                            rect: Rect {
-                                x: -20,
-                                y: 40,
-                                width: 800,
-                                height: 600,
-                            },
+                        }),
+                        Tile::Split {
+                            layout: Layout::SplitV,
+                            children: vec![
+                                Tile::Window(window("left")),
+                                Tile::Split {
+                                    layout: Layout::Stacked,
+                                    children: vec![
+                                        Tile::Window(window("a")),
+                                        Tile::Window(window("b")),
+                                        Tile::Window(window("c")),
+                                    ],
+                                },
+                            ],
                         },
                     ],
+                    floating: vec![Window {
+                        app_id: String::new(),
+                        title: "it's a \u{e9}dge case; rm -rf".to_string(),
+                        argv: vec!["sh".to_string(), "-c".to_string(), "echo 'hi'".to_string()],
+                        floating: true,
+                        fullscreen: false,
+                        focused: false,
+                        rect: Rect {
+                            x: -20,
+                            y: 40,
+                            width: 800,
+                            height: 600,
+                        },
+                    }],
                 },
                 Workspace {
                     name: "web".to_string(),
                     output: "HDMI-A-1".to_string(),
                     layout: Layout::SplitV,
-                    windows: Vec::new(),
+                    tiles: Vec::new(),
+                    floating: Vec::new(),
                 },
             ],
             scratchpad: vec![Window {
@@ -309,7 +413,7 @@ mod tests {
             decoded
                 .workspaces
                 .iter()
-                .all(|w| w.windows.iter().all(|v| v.app_id != "signal"))
+                .all(|w| w.floating.iter().all(|v| v.app_id != "signal"))
         );
     }
 
@@ -339,5 +443,75 @@ mod tests {
         let mut bytes = encode(&sample());
         bytes[6..10].copy_from_slice(&u32::MAX.to_le_bytes());
         assert!(matches!(decode(&bytes), Err(Error::Truncated)));
+    }
+
+    #[test]
+    fn reads_version_1() {
+        let tiling = window("tiling");
+        let floating = Window {
+            floating: true,
+            ..window("floating")
+        };
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&MAGIC);
+        bytes.extend_from_slice(&1u16.to_le_bytes());
+        put_u32(&mut bytes, 1);
+        put_str(&mut bytes, "1");
+        put_str(&mut bytes, "eDP-1");
+        bytes.push(Layout::Tabbed as u8);
+        put_windows(&mut bytes, &[tiling.clone(), floating.clone()]);
+        put_windows(&mut bytes, &[]);
+
+        let session = decode(&bytes).unwrap();
+        assert_eq!(
+            session.workspaces,
+            vec![Workspace {
+                name: "1".to_string(),
+                output: "eDP-1".to_string(),
+                layout: Layout::Tabbed,
+                tiles: vec![Tile::Window(tiling)],
+                floating: vec![floating],
+            }]
+        );
+    }
+
+    #[test]
+    fn rejects_unknown_tile() {
+        let mut bytes = encode(&Session {
+            workspaces: vec![Workspace {
+                name: "1".to_string(),
+                output: String::new(),
+                layout: Layout::SplitH,
+                tiles: vec![Tile::Window(window("x"))],
+                floating: Vec::new(),
+            }],
+            scratchpad: Vec::new(),
+        });
+        // header, workspace count, name "1", empty output, layout, tile count
+        let kind = 4 + 2 + 4 + 5 + 4 + 1 + 4;
+        bytes[kind] = 7;
+        assert!(matches!(decode(&bytes), Err(Error::BadTile(7))));
+    }
+
+    #[test]
+    fn rejects_deep_nesting() {
+        let mut tile = Tile::Window(window("x"));
+        for _ in 0..=MAX_DEPTH + 1 {
+            tile = Tile::Split {
+                layout: Layout::SplitH,
+                children: vec![tile],
+            };
+        }
+        let bytes = encode(&Session {
+            workspaces: vec![Workspace {
+                name: "1".to_string(),
+                output: String::new(),
+                layout: Layout::SplitH,
+                tiles: vec![tile],
+                floating: Vec::new(),
+            }],
+            scratchpad: Vec::new(),
+        });
+        assert!(matches!(decode(&bytes), Err(Error::TooDeep)));
     }
 }

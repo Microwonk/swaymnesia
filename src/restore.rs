@@ -1,4 +1,4 @@
-use crate::session::{Session, Window};
+use crate::session::{Layout, Session, Tile, Window};
 use std::error::Error;
 use std::process::{Command, Stdio};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
@@ -12,14 +12,37 @@ const SPAWN_TIMEOUT: Duration = Duration::from_secs(15);
 /// How long to let the last windows settle before giving them their final geometry
 const SETTLE: Duration = Duration::from_millis(500);
 
+/// Marks the window that the next one is moved behind while the tiling tree is rebuilt
+const MARK: &str = "_swaymnesia";
+
+/// A restored tile whose windows all appeared, identified by their sway container ids
+enum Placed {
+    Window(i64),
+    Split(Layout, Vec<Placed>),
+}
+
+impl Placed {
+    fn first_window(&self) -> i64 {
+        match self {
+            Placed::Window(id) => *id,
+            Placed::Split(_, children) => children[0].first_window(),
+        }
+    }
+}
+
+/// Windows whose state is applied once every window has been started
+#[derive(Default)]
+struct Pending<'a> {
+    floating: Vec<(i64, &'a Window)>,
+    scratchpad: Vec<i64>,
+    fullscreen: Vec<i64>,
+    focused: Option<i64>,
+}
+
 pub fn restore(session: &Session) -> Result<(), Box<dyn Error>> {
     let new_windows = watch_new_windows()?;
     let mut conn = SwayConnection::new()?;
-
-    let mut floating = Vec::new();
-    let mut scratchpad = Vec::new();
-    let mut fullscreen = Vec::new();
-    let mut focused = None;
+    let mut pending = Pending::default();
 
     for workspace in &session.workspaces {
         run(
@@ -40,42 +63,46 @@ pub fn restore(session: &Session) -> Result<(), Box<dyn Error>> {
             &format!("layout {}", workspace.layout.as_command()),
         );
 
-        for window in &workspace.windows {
-            let Some(id) = spawn_and_wait(&new_windows, window)? else {
-                continue;
-            };
+        let mut tiles = Vec::new();
+        for tile in &workspace.tiles {
+            if let Some(placed) =
+                spawn_tile(&mut conn, &new_windows, tile, &workspace.name, &mut pending)?
+            {
+                tiles.push(placed);
+            }
+        }
+        // The windows were opened side by side on the workspace, nest them into their splits
+        line_up(&mut conn, &tiles);
+        for tile in &tiles {
+            arrange(&mut conn, tile);
+        }
 
-            run(
+        for window in &workspace.floating {
+            if let Some(id) = spawn_window(
                 &mut conn,
-                &format!(
-                    "[con_id={id}] move container to workspace {}",
-                    quote(&workspace.name)
-                ),
-            );
-            if window.floating {
+                &new_windows,
+                window,
+                &workspace.name,
+                &mut pending,
+            )? {
                 run(&mut conn, &format!("[con_id={id}] floating enable"));
-                floating.push((id, window));
-            }
-            if window.fullscreen {
-                fullscreen.push(id);
-            }
-            if window.focused {
-                focused = Some(id);
+                pending.floating.push((id, window));
             }
         }
     }
+    run(&mut conn, &format!("unmark {MARK}"));
 
     for window in &session.scratchpad {
         let Some(id) = spawn_and_wait(&new_windows, window)? else {
             continue;
         };
         run(&mut conn, &format!("[con_id={id}] floating enable"));
-        floating.push((id, window));
-        scratchpad.push(id);
+        pending.floating.push((id, window));
+        pending.scratchpad.push(id);
     }
 
     thread::sleep(SETTLE);
-    for (id, window) in floating {
+    for (id, window) in pending.floating {
         run(
             &mut conn,
             &format!(
@@ -92,19 +119,113 @@ pub fn restore(session: &Session) -> Result<(), Box<dyn Error>> {
         );
     }
 
-    for id in scratchpad {
+    for id in pending.scratchpad {
         run(&mut conn, &format!("[con_id={id}] move scratchpad"));
     }
 
-    for id in fullscreen {
+    for id in pending.fullscreen {
         run(&mut conn, &format!("[con_id={id}] fullscreen enable"));
     }
 
-    if let Some(id) = focused {
+    if let Some(id) = pending.focused {
         run(&mut conn, &format!("[con_id={id}] focus"));
     }
 
     Ok(())
+}
+
+/// Starts every window of `tile`, leaving out the windows that did not appear and the splits
+/// that became empty
+fn spawn_tile<'a>(
+    conn: &mut SwayConnection,
+    new_windows: &Receiver<i64>,
+    tile: &'a Tile,
+    workspace: &str,
+    pending: &mut Pending<'a>,
+) -> Result<Option<Placed>, Box<dyn Error>> {
+    Ok(match tile {
+        Tile::Window(window) => {
+            spawn_window(conn, new_windows, window, workspace, pending)?.map(Placed::Window)
+        }
+        Tile::Split { layout, children } => {
+            let mut placed = Vec::new();
+            for child in children {
+                if let Some(child) = spawn_tile(conn, new_windows, child, workspace, pending)? {
+                    placed.push(child);
+                }
+            }
+            match placed.len() {
+                0 | 1 => placed.pop(),
+                _ => Some(Placed::Split(*layout, placed)),
+            }
+        }
+    })
+}
+
+/// Starts `window` on `workspace` and returns its container id
+fn spawn_window<'a>(
+    conn: &mut SwayConnection,
+    new_windows: &Receiver<i64>,
+    window: &'a Window,
+    workspace: &str,
+    pending: &mut Pending<'a>,
+) -> Result<Option<i64>, Box<dyn Error>> {
+    let Some(id) = spawn_and_wait(new_windows, window)? else {
+        return Ok(None);
+    };
+    run(
+        conn,
+        &format!(
+            "[con_id={id}] move container to workspace {}",
+            quote(workspace)
+        ),
+    );
+    if window.fullscreen {
+        pending.fullscreen.push(id);
+    }
+    if window.focused {
+        pending.focused = Some(id);
+    }
+    Ok(Some(id))
+}
+
+/// Turns the first window of `tile` into the split it stands for, then does the same for each
+/// child of the split.
+///
+/// Every window of `tile` has to be a sibling of its first window, in the order of the tree.
+fn arrange(conn: &mut SwayConnection, tile: &Placed) {
+    let Placed::Split(layout, children) = tile else {
+        return;
+    };
+    let first = tile.first_window();
+    run(
+        conn,
+        &format!("[con_id={first}] {}", layout.split_command()),
+    );
+    // Applied to a window, `layout` changes the container the window is in
+    run(
+        conn,
+        &format!("[con_id={first}] layout {}", layout.as_command()),
+    );
+    line_up(conn, children);
+    for child in children {
+        arrange(conn, child);
+    }
+}
+
+/// Moves the first window of each tile right behind the first window of the tile before it.
+///
+/// Moving a container to a marked window inserts it next to that window, so this gathers the
+/// tiles in the container of the first one, in their order.
+fn line_up(conn: &mut SwayConnection, tiles: &[Placed]) {
+    for pair in tiles.windows(2) {
+        let (behind, window) = (pair[0].first_window(), pair[1].first_window());
+        run(conn, &format!("[con_id={behind}] mark {MARK}"));
+        run(
+            conn,
+            &format!("[con_id={window}] move container to mark {MARK}"),
+        );
+    }
 }
 
 /// Starts the program which was recorded for `window` and returns the id of the window from sway.
