@@ -37,6 +37,8 @@ exec swaymnesia restore && swaymnesia watch
 * its geometry
 
 A window is only restorable if its command line can be read from `/proc`.
+Flatpak apps are recorded as `flatpak run <app-id>`, without their arguments,
+since their command line refers to paths inside the sandbox.
 Sessions are keyed on the workspace name, so restoring on a different machine
 (with different outputs) works.
 

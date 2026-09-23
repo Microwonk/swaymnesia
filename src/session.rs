@@ -229,7 +229,9 @@ fn view(node: &Node, floating: bool, config: &Config) -> Option<Window> {
     if !node.nodes.is_empty() || !node.floating_nodes.is_empty() {
         return None;
     }
-    let argv = node.pid.and_then(cmdline)?;
+    let argv = node
+        .pid
+        .and_then(|pid| flatpak_command(pid).or_else(|| cmdline(pid)))?;
     let app_id = node
         .app_id
         .clone()
@@ -255,6 +257,35 @@ fn view(node: &Node, floating: bool, config: &Config) -> Option<Window> {
             height: node.rect.height,
         },
     })
+}
+
+/// The command that starts the Flatpak app [pid] belongs to, if it runs in a Flatpak sandbox.
+///
+/// The command line of a sandboxed process names paths inside the sandbox (e.g. "/app/bin/foo"),
+/// which do not exist on the host, so the app has to be started through `flatpak run` instead.
+/// Its arguments are dropped, as they may come from wrapper scripts inside the sandbox that add
+/// them again, and paths in them are only valid inside the sandbox.
+fn flatpak_command(pid: i32) -> Option<Vec<String>> {
+    let info = fs::read_to_string(format!("/proc/{pid}/root/.flatpak-info")).ok()?;
+    let app_id = flatpak_app_id(&info)?;
+    Some(vec!["flatpak".into(), "run".into(), app_id.into()])
+}
+
+/// The `name` key of the `[Application]` group in the keyfile `.flatpak-info`
+fn flatpak_app_id(info: &str) -> Option<&str> {
+    let mut in_application = false;
+    for line in info.lines().map(str::trim) {
+        if line.starts_with('[') {
+            in_application = line == "[Application]";
+        } else if in_application
+            && let Some((key, value)) = line.split_once('=')
+            && key.trim() == "name"
+        {
+            let value = value.trim();
+            return (!value.is_empty()).then_some(value);
+        }
+    }
+    None
 }
 
 /// Read argv from `/proc` via [pid]
@@ -296,4 +327,22 @@ fn is_program(name: &str) -> bool {
 
 fn is_executable(path: &Path) -> bool {
     fs::metadata(path).is_ok_and(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn flatpak_app_id_from_application_group() {
+        let info = "[Application]\nname=com.discordapp.Discord\nruntime=runtime/x/y/z\n\n\
+                    [Instance]\nname=not-this\nbranch=stable\n";
+        assert_eq!(flatpak_app_id(info), Some("com.discordapp.Discord"));
+    }
+
+    #[test]
+    fn flatpak_app_id_ignores_other_groups() {
+        assert_eq!(flatpak_app_id("[Instance]\nname=org.example.App\n"), None);
+        assert_eq!(flatpak_app_id("[Application]\nname=\n"), None);
+    }
 }
